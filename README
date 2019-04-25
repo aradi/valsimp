@@ -1,0 +1,28 @@
+ValSimP - Validation framework for scientifical simulation packages
+===================================================================
+
+ValSimP is a lightweight extensible validation framework for
+scientifical simulation packages. It tests the outcome of simulations
+against reference data to ensure that a simulation package works the
+expected way.
+
+In the typical scenario developers of scientifical simulation packages
+set up test suites with ValSimP which are then distributed together with
+the simulation software. After compiling/installing the program the end
+users use ValSimP to test whether their local installation works as
+expected. ValSimP can be also easily extended by the end users to adapt
+the validation procedure to their local environment (e.g. running the
+simulations via a queue system).
+
+Requires Python 3 or later and NumPy.
+
+
+Installation
+------------
+
+Use the normal python distutils package via `setup.py`:
+
+  python setup.py install
+
+For non standard installation paths, use the `-prefix` option of
+setup.py.

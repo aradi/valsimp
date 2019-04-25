@@ -1,0 +1,3 @@
+Making path names more robust. (Specifing absolute path als testcase leads to
+testcase names starting "/" which causes overwriting of the files in the orginal
+testdir.

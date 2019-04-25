@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+###############################################################################
+# This file is part of the ValSimP package.
+# See the packages LICENSE file for copyright and licensing conditions.
+###############################################################################
+import sys
+if sys.hexversion < 0x030102f0:
+    sys.stderr.write("This script needs Python version 3.1 or newer.\n")
+    sys.exit(-1)
+from optparse import OptionParser
+import glob
+import pickle
+import os
+import tempfile
+import shutil
+import time
+import valsimp as vsp
+import io
+import collections
+import valsimp.io.logger as vsplog
+
+
+usage = """%prog [options] [ test1 [ test2 [ ... ] ] ]
+
+Validate a simulation package using selected test cases."""
+
+#  Possible actions and their action characters (to be entered by the user)
+ACT_PREPARE = "P"
+ACT_RUN = "S"
+ACT_TEST = "T"
+ACT_REPORT = "R"
+ACT_CLEANUP = "C"
+
+# File to store the status of ValSimP for a given testcase
+FILE_VSPSTATUS = ".vspstatus.bin"
+# File containing the tester definitions for ValSimP.
+FILE_VALSIMPIN = "valsimp.in"
+
+# Seconds to wait after catching Ctrl-C so that a further Ctrl-C within this
+# interval can stop the entire script not just the current action
+INTERRUPT_PAUSE = 0.5
+
+stdlog = vsplog.TestLogger()
+
+class TestData():
+    """Class for representing the data to be saved about a test case."""
+
+    def __init__(self):
+        """Initializes TestData instance. All status is set to not run."""
+        self.status = { ACT_PREPARE: vsp.STATUS_NOTRUN,
+                        ACT_RUN: vsp.STATUS_NOTRUN,
+                        ACT_TEST: vsp.STATUS_NOTRUN,
+                       }
+        self._logtarget = io.StringIO()
+        self.log = vsplog.TestLogger(self._logtarget)
+
+    @classmethod
+    def fromfile(cls, fname):
+        """Create testcase from a file.
+
+        Args:
+            fname: File which contains pickled TestData object.
+
+        Returns:
+            TestData object with fields initialized according to the file.
+
+        Note:
+            If file fname can not be opened for reading, an empty (initialized)
+            instance is returned.
+        """
+        testdata = cls()
+        # pickling attribute by attribute as self with IOString
+        # can not be pickled apparently.
+        try:
+            fp = open(fname, "rb")
+        except IOError:
+            pass
+        else:
+            testdata._logtarget.write(pickle.load(fp))
+            testdata.status = pickle.load(fp)
+            fp.close()
+        return testdata
+
+    def tofile(self, fname):
+        """Dumps TestData object into a file.
+
+        Args:
+            fname: File to store the object.
+
+        Note:
+            If fname can not be opened for writing, the method silently returns
+            without writing anything.
+        """
+        try:
+            fp = open(fname, "wb")
+        except IOError:
+            pass
+        else:
+            pickle.dump(self._logtarget.getvalue(), fp)
+            pickle.dump(self.status, fp)
+            fp.close()
+
+    def getlogtext(self):
+        """Returns log text collected so far."""
+        return self._logtarget.getvalue()
+
+
+def get_cmdlineoptions():
+    """Delivering command line options and arguments."""
+
+    parser = OptionParser(usage=usage)
+    parser.add_option("-l", "--list", dest="list", action="store_true",
+                      default=False, help="list the tests which would be "
+                      "executed and stop.")
+    parser.add_option("-a", "--actions", dest="actions", action="store",
+                      default="PSTR", help="actions to do, specified "
+                      "as a combination of following characters:\n"
+                      "P (prepare tests), S (start/run simulations), "
+                      "T (test results), R (generate report), C (cleanup), "
+                      "(default: PSTR)")
+    parser.add_option("-f", "--file", dest="testfile", action="append",
+                      help="execute tests listed in a given file")
+    parser.add_option("-t", "--testroot", dest="testroot", action="store",
+                      default=".", help="root of the test directories")
+    parser.add_option("-w", "--workroot", dest="workroot", action="store",
+                      default="/tmp",
+                      help="root of the test directories")
+    parser.add_option("-r", "--report-file", dest="reportfile", action="store",
+                      help="file where detailed report should be written "
+                      "instead of stdout")
+    parser.add_option("-p", "--pypath", dest="pypath", action="append",
+                      help="extend search path for python modules with "
+                      "given path")
+    parser.add_option("-c", "--context", dest="context", action="append",
+                      help="define a context variable")
+    return parser.parse_args()
+
+def gettestcases(testroot, testfiles, tests):
+    """Return list of all test cases to process while filtering duplicates.
+
+    Args:
+        testroot: Parent directory containing the tests.
+        testfiles: Files containing test case names or test case patterns.
+        tests: Explicitely specified tests or test patterns.
+
+    Returns:
+        List of tests which match specified names and patterns.
+    """
+    patterns = []
+    if testfiles:
+        for testfile in testfiles:
+            fp = open(os.path.abspath(testfile), "r")
+            lines = [ line.strip() for line in fp.readlines() ]
+            fp.close()
+            patterns += [ line for line in lines if line ]
+    patterns += tests
+    testcases = collections.OrderedDict()
+    for pattern in patterns:
+        testdirs = glob.glob(os.path.join(testroot, pattern))
+        for testdir in testdirs:
+            testcases[os.path.relpath(testdir, testroot)] = True
+    return testcases.keys()
+
+def print_testcaselist(testcases):
+    """Print specified testcases in a suitable format.
+
+    Args:
+        testcases: test cases to print.
+    """
+    print(" ".join(testcases))
+
+def getpassedcontext(contextdefs):
+    """Return a context directory based on the list of passed context options.
+
+    Args:
+        contextdefs: List of context definitions (variable=value)
+
+    Returns:
+        Dictionary with passed variables as keys and corresponding values.
+    """
+    ctxdir = {}
+    if contextdefs:
+        for contdef in contextdefs:
+            lhs, rhs = contdef.split("=")
+            ctxdir[lhs.strip()] = rhs.strip()
+    return ctxdir
+
+def createcontext(testroot, workroot, testcase):
+    """Create a test case dependent internal context class.
+
+    Args:
+        testroot: Parent directory for the test cases.
+        workroot: Parent directory for the working directories.
+        testcase: Name of current test case.
+
+    Returns:
+        Context class, containing attributes/values corresponding to
+        the internal settings for the given testcase.
+    """
+    ctxdir = {}
+    ctxdir["testroot"] = testroot
+    ctxdir["testcase"] = testcase
+    ctxdir["testdir"] = os.path.join(testroot, testcase)
+    ctxdir["workroot"] = workroot
+    ctxdir["workdir"] = os.path.join(workroot, testcase)
+    ctxdir["testdatafile"] =  os.path.join(ctxdir["workdir"], FILE_VSPSTATUS)
+    ctxdir["log"] = None
+    ctx = vsp.DictClass(ctxdir)
+    return ctx
+
+def getactions(cmdactions):
+    """Determine which actions to carry out.
+
+    Args:
+        cmdactions: String containing the letters for the actions to take.
+
+    Returns:
+        Dictionary with True or False for all possible actions, depending
+        whether the action is desired or not.
+    """
+    actions = {}
+    actions[ACT_PREPARE] = ACT_PREPARE in cmdactions
+    actions[ACT_RUN] = ACT_RUN in cmdactions
+    actions[ACT_TEST] = ACT_TEST in cmdactions
+    actions[ACT_REPORT] = ACT_REPORT in cmdactions
+    actions[ACT_CLEANUP] = ACT_CLEANUP in cmdactions
+    return actions
+
+def gettester(ctx, ctxext):
+    """Get tester object by executing ValSimP input file in given context.
+
+    Runs the input file for ValSimP with the internal and external context
+    as environment and returns the object to which the variable 'testcase'
+    points to.
+
+    Args:
+        ctx: Internal context for current test case.
+        ctxext: External context (passed via command line options)
+
+    Returns:
+        Tester object defined in the input file.
+    """
+    fp = open(os.path.join(ctx.testdir, FILE_VALSIMPIN), "r")
+    cmd = fp.read()
+    fp.close()
+    env = { "ctx": ctx, "ctxext": ctxext }
+    exec(cmd, env)
+    tester = env.get("testcase")
+    return tester
+
+def testcase_prepare(testcase, ctx, tester):
+    """Prepare a given testcase.
+
+    Args:
+        testcase: Name of the test case to prepare.
+        ctx: Current (internal) context.
+        tester: Tester object of the current test case.
+
+    Returns:
+        Status flag signaling the success of the preparation.
+    """
+    ACTION = "preparing"
+    ctx.log.teststart(testcase, ACTION)
+    stdlog.teststart(testcase, ACTION)
+    msg = ""
+    try:
+        if os.path.isdir(ctx.workdir):
+            shutil.rmtree(ctx.workdir)
+        os.makedirs(ctx.workdir)
+        tester.prepare()
+        status = vsp.STATUS_OK
+    except KeyboardInterrupt:
+        status = vsp.STATUS_INTERRUPTED
+    except Exception as ex:
+        status = vsp.STATUS_ERROR
+        msg = str(ex)
+    ctx.log.decreaseindent()
+    ctx.log.testresult(testcase, ACTION, status, msg)
+    stdlog.testresult(testcase, ACTION, status, msg)
+    return status
+
+def testcase_run(testcase, ctx, tester):
+    """Runs a given testcase.
+
+    Args:
+        testcase: Name of the test case to run.
+        ctx: Current (internal) context.
+        tester: Tester object of the current test case.
+
+    Returns:
+        Status flag signaling the success of the run.
+    """
+    ACTION = "running"
+    ctx.log.teststart(testcase, ACTION)
+    stdlog.teststart(testcase, ACTION)
+    msg = ""
+    try:
+        tester.run()
+        status = vsp.STATUS_OK
+    except KeyboardInterrupt:
+        status = vsp.STATUS_INTERRUPTED
+        time.sleep(INTERRUPT_PAUSE)
+    except Exception as ex:
+        status = vsp.STATUS_ERROR
+        msg = str(ex)
+    ctx.log.testresult(testcase, ACTION, status, msg)
+    stdlog.testresult(testcase, ACTION, status, msg)
+    return status
+
+def testcase_test(testcase, ctx, tester):
+    """Test the result of a run in a given testcase.
+
+    Args:
+        testcase: Name of the test case to test.
+        ctx: Current (internal) context.
+        tester: Tester object of the current test case.
+
+    Returns:
+        Status flag signaling the success of the testing process.
+    """
+    ACTION = "testing"
+    ctx.log.teststart(testcase, ACTION)
+    stdlog.teststart(testcase, ACTION)
+    msg = ""
+    try:
+        teststat = tester.test()
+        status = vsp.STATUS_OK if teststat else vsp.STATUS_FAILED
+    except KeyboardInterrupt:
+        status = vsp.STATUS_INTERRUPTED
+        time.sleep(0.5)
+    except Exception as ex:
+        status = vsp.STATUS_ERROR
+        msg = str(ex)
+    ctx.log.testresult(testcase, ACTION, status, msg)
+    stdlog.testresult(testcase, ACTION, status, msg)
+    return status
+
+def testcases_report(testcases, contexts, reportfile=None):
+    """Generate a report about the status of the given testcases.
+
+    Args:
+        testcases: Test case names to be included in the report.
+        contexts: List containing the context of each test case.
+        reportfile: Optional, if specified, file with the given name will be
+            created for the detailed report, otherwise it will be written to
+            standard output.
+    """
+    stdlog.write(vsplog.REPORT_HEADER)
+    if reportfile:
+        fp = open(reportfile, "w")
+    else:
+        fp = io.StringIO()
+    reportlog = vsplog.TestLogger(fp)
+    for testcase, ctx in zip(testcases, contexts):
+        testdata = TestData.fromfile(ctx.testdatafile)
+        stdlog.testsummary(testcase, testdata.status[ACT_PREPARE],
+                               testdata.status[ACT_RUN],
+                               testdata.status[ACT_TEST])
+        reportlog.testheader(testcase)
+        reportlog.write(testdata.getlogtext())
+    stdlog.writeline(vsplog.REPORT_SEPARATOR)
+
+    if reportfile:
+        fp.close()
+        stdlog.writeline("Detailed report written to '%s'" % reportfile)
+    else:
+        stdlog.write(fp.getvalue())
+    stdlog.writeline(vsplog.REPORT_SEPARATOR)
+
+def testcase_cleanup(tester, ctx):
+    """Clean up the test case.
+
+    Args:
+        tester: Tester object for the test case to be cleaned up.
+        ctx: Context of the test case.
+    """
+    tester.cleanup()
+    try:
+        shutil.rmtree(ctx.workdir)
+    except OSError:
+        pass
+
+
+def main():
+    """Main routine."""
+
+    options, args = get_cmdlineoptions()
+    testroot = os.path.abspath(options.testroot)
+    workroot = os.path.abspath(options.workroot)
+    testcases = gettestcases(testroot, options.testfile, args)
+
+    # Print testcases and exit, if desired.
+    if options.list:
+        print_testcaselist(testcases)
+        sys.exit(0)
+
+    # Extend system path
+    if options.pypath:
+        sys.path += [ os.path.abspath(path) for path in options.pypath ]
+
+    ctxext = vsp.DictClass(getpassedcontext(options.context))
+    contexts = [ createcontext(testroot, workroot, testcase)
+                 for testcase in testcases ]
+    actions = getactions(options.actions)
+
+    if actions[ACT_PREPARE] or actions[ACT_RUN] or actions[ACT_TEST]:
+        for testcase, ctx in zip(testcases, contexts):
+            testdata = TestData.fromfile(ctx.testdatafile)
+            ctx.log = testdata.log
+            tester = gettester(ctx, ctxext)
+
+            if (actions[ACT_PREPARE]
+                    and testdata.status[ACT_PREPARE] != vsp.STATUS_OK):
+                testdata.status[ACT_PREPARE] = testcase_prepare(testcase, ctx,
+                                                                tester)
+                testdata.tofile(ctx.testdatafile)
+
+            if (actions[ACT_RUN] and testdata.status[ACT_RUN] != vsp.STATUS_OK
+                    and testdata.status[ACT_PREPARE] == vsp.STATUS_OK):
+                testdata.status[ACT_RUN] = testcase_run(testcase, ctx, tester)
+                testdata.tofile(ctx.testdatafile)
+
+            if (actions[ACT_TEST] and testdata.status[ACT_TEST] != vsp.STATUS_OK
+                    and tester.runfinished()
+                    and testdata.status[ACT_RUN] == vsp.STATUS_OK):
+                testdata.status[ACT_TEST] = testcase_test(testcase, ctx, tester)
+                testdata.tofile(ctx.testdatafile)
+
+    if actions[ACT_REPORT]:
+        testcases_report(testcases, contexts, options.reportfile)
+
+    if actions[ACT_CLEANUP]:
+        for testcase, ctx in zip(testcases, contexts):
+            tester = gettester(ctx, ctxext)
+            testcase_cleanup(tester, ctx)
+
+
+if __name__ == "__main__":
+    main()
